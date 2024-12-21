@@ -1,7 +1,7 @@
 # ussd_app/urls.py
 from django.urls import path
-from .views import ussd
+from . import views
 
 urlpatterns = [
-    path('', ussd, name='ussd'),
-]
+    path('', views.ussd, name='ussd'),
+  ]
