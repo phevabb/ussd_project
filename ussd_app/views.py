@@ -26,8 +26,6 @@ def update_session_state(session_id, state):
 
 
 
-
-
 @csrf_exempt
 def ussd(request):
 
@@ -62,11 +60,107 @@ def ussd(request):
             update_session_state(session_id, "WAITING_FOR_LIST_NAME")
             return HttpResponse(response, content_type="text/plain")
         elif text == "2":
-            response = "END Viewing shopping lists is not implemented yet.\n"
+            all_lists = ShoppingList.objects.filter(phone_number=phone_number)
+            last_3_items = all_lists.order_by('-id')[:3]  # Get the last 3 items based on ID
+
+            response = "CON Last 3 shopping lists.\n"
+            response += f"1. {last_3_items[0]}\n"
+            response += f"2. {last_3_items[1]}\n"
+            response += f"3. {last_3_items[2]}\n"
+            update_session_state(session_id, "PREVIOUS_LIST")
+
             return HttpResponse(response, content_type="text/plain")
         else:
             response = "END Invalid input.\n"
             return HttpResponse(response, content_type="text/plain")
+
+    elif state == "PREVIOUS_LIST":
+        update_session_state(session_id, "ORDER_THIS_LIST")
+        selected_option = text.split('*')
+
+        actual_option =selected_option[1]
+        all_lists = ShoppingList.objects.filter(phone_number=phone_number)
+        last_3_items = all_lists.order_by('created_at')[:3]  # Get the last 3 items based on ID
+
+        if actual_option == "1":
+            ShoppingList.objects.create(
+                session_id=session_id,
+                phone_number=phone_number,
+                list_name=last_3_items[0]
+            )
+            response = "CON Order this list? .\n"
+            response += f"{last_3_items[0]}\n"
+            update_session_state(session_id, "ORDER_THIS_LIST")
+            response += "1. Confirm \n"
+            response += "2. Edit \n"
+            response += "3. Cancel"
+            return HttpResponse(response, content_type="text/plain")
+
+        elif actual_option == "2":
+            ShoppingList.objects.create(
+                session_id=session_id,
+                phone_number=phone_number,
+                list_name=last_3_items[1]
+            )
+            response = "CON Order this list? .\n"
+            response += f"{last_3_items[1]}\n"
+            response += "1. Confirm \n"
+            response += "2. Edit \n"
+            response += "3. Cancel"
+            return HttpResponse(response, content_type="text/plain")
+
+
+        elif actual_option == "3":
+            ShoppingList.objects.create(
+                session_id=session_id,
+                phone_number=phone_number,
+                list_name=last_3_items[2]
+            )
+            response = "CON Order this list? .\n"
+            response += f"{last_3_items[2]}\n"
+            response += "1. Confirm \n"
+            response += "2. Edit \n"
+            response += "3. Cancel"
+            return HttpResponse(response, content_type="text/plain")
+
+
+    elif state == "ORDER_THIS_LIST":
+        number = text.split('*', 2)
+        actual_option =number[-1]
+
+        if actual_option == "1":
+            response = "END List Ordered Successfully .\n"
+            return HttpResponse(response, content_type="text/plain")
+
+        elif actual_option == "2":
+            update_session_state(session_id, "EDITED_PREVIOUS_LIST")
+            response = "CON Please make changes .\n"
+            response += "eg. rice 4kg, fish 3kg, milk 1tin.\n"
+            return HttpResponse(response, content_type="text/plain")
+
+
+        elif actual_option == "3":
+            ShoppingList.objects.filter(session_id=session_id).delete()
+            response = "END List Order Canceled .\n"
+            return HttpResponse(response, content_type="text/plain")
+        else:
+            response = "END Invalid input.\n"
+            return HttpResponse(response, content_type="text/plain")
+
+    elif state == "EDITED_PREVIOUS_LIST":
+        print(f"the current state is {state}")
+        edited_stuff = text.split('*', 3)
+        print(f"the edited stuff is {edited_stuff}")
+        final_stuff = edited_stuff[3]
+        print(f"the final stuff is {final_stuff}")
+        obj = get_object_or_404(ShoppingList, session_id=session_id)
+        obj.list_name = final_stuff
+        obj.save()
+        response = "END Selected List Successfully updated .\n"
+        return HttpResponse(response, content_type="text/plain")
+
+
+
 
     elif state == "WAITING_FOR_LIST_NAME":
 
@@ -94,12 +188,12 @@ def ussd(request):
         inputs = text.split('*')
         selected_option = inputs[-1]
         if selected_option == "1":
-            print(f"this is the actual text {selected_option}")
+
             response = "END Items saved :\n"
             return HttpResponse(response, content_type="text/plain")
 
         elif selected_option == "2":
-            print(f"SECOND this is the actual text {selected_option}")
+
             response = "CON Edit list :\n"
             response += "eg. rice 4kg, fish 3kg, milk 1tin"
             update_session_state(session_id, "LIST_EDIT")
@@ -113,16 +207,11 @@ def ussd(request):
 
     elif state == "LIST_EDIT":
 
-        print(f"unedited input {text}")
-
         inputs = text.split('*', 3)
-        print(f"THE INPUTS: {inputs}.")
         if len(inputs) > 1:
-            updated_items = inputs[3]
-            print(f"THE updated_items: {updated_items}.")
-            # Update the list name for the object with the matching session_id
+            updated_items = inputs[3]            # Update the list name for the object with the matching session_id
             obj = get_object_or_404(ShoppingList, session_id=session_id)
-            print(f"THE obj: {obj}.")
+
             obj.list_name = updated_items
             obj.save()
             response = "END List updated successfully.\n"
@@ -160,7 +249,7 @@ def ussd(request):
         response += "1. [List Date: 12/12/2024] \n"
         response += "2. [List Date: 10/12/2024] \n"
         response += "3. [List Date: 08/12/2024] \n"
-        response += "0. Back \n"
+
     else:
         response = "END Invalid selection."
 
