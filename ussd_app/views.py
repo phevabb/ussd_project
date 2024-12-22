@@ -2,7 +2,7 @@ from http.client import responses
 
 from django.http import HttpResponse
 from.models import ShoppingList
-from django.shortcuts import redirect
+from django.shortcuts import redirect, get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.urls import reverse
 import urllib.parse
@@ -11,7 +11,7 @@ import urllib.parse
 from django.core.cache import cache
 
 # Default timeout for session states (in seconds)
-SESSION_TIMEOUT = 300  # 5 minutes
+SESSION_TIMEOUT = 900  # 5 minutes
 
 def get_session_state(session_id):
     """
@@ -20,11 +20,7 @@ def get_session_state(session_id):
     """
     return cache.get(session_id, "START")
 
-def update_session_state(session_id, state, extra_data=None):
-
-    if extra_data is None:
-        extra_data = {}
-
+def update_session_state(session_id, state):
     cache.set(session_id, state, timeout=SESSION_TIMEOUT)
 
 
@@ -76,32 +72,65 @@ def ussd(request):
 
         inputs = text.split('*')
         if len(inputs) > 1:
-            user_list = inputs[1]  # This contains the shopping list
-        else:
-            user_list = text
-
-        response = f"CON Your List:\n"
-        update_session_state(session_id, "DISPLAY_LIST", {"user_list": user_list})
-        response += f"Your List:({user_list}).\n"
-        response += "1. Confirm and Save\n"
-        response += "3. Edit\n"
-        response += "4. Cancel list\n"
-        return HttpResponse(response, content_type="text/plain")
-
-    elif state == "DISPLAY_LIST":
-        session_data = get_session_state(session_id)
-        user_list = session_data.get("user_list", "")
-        print(f"Reach here .........State: {state}, Text: {text} user_list: {user_list}")
-
-        if text == "1":
+            items = inputs[1]
             ShoppingList.objects.create(
                 session_id=session_id,
                 phone_number=phone_number,
-                list_name=user_list
-            )
-            update_session_state(session_id, "ITEMS_ADDED")
-            response = f"END Your Items Added Successfully:\n"
+                list_name=items
+                )
+        else:
+            response = "END list not made.\n"
             return HttpResponse(response, content_type="text/plain")
+        response = f"CON Your List:\n"
+        update_session_state(session_id, "DISPLAY_LIST")
+        response += f"Your List:({items}).\n"
+        response += "1. Confirm and Save\n"
+        response += "2. Edit\n"
+        response += "3. Cancel list\n"
+        return HttpResponse(response, content_type="text/plain")
+
+    elif state == "DISPLAY_LIST":
+
+        inputs = text.split('*')
+        selected_option = inputs[-1]
+        if selected_option == "1":
+            print(f"this is the actual text {selected_option}")
+            response = "END Items saved :\n"
+            return HttpResponse(response, content_type="text/plain")
+
+        elif selected_option == "2":
+            print(f"SECOND this is the actual text {selected_option}")
+            response = "CON Edit list :\n"
+            response += "eg. rice 4kg, fish 3kg, milk 1tin"
+            update_session_state(session_id, "LIST_EDIT")
+            return HttpResponse(response, content_type="text/plain")
+        elif selected_option == "3":
+            ShoppingList.objects.filter(session_id=session_id).delete()
+            response = "END list successfully deleted :\n"
+            return HttpResponse(response, content_type="text/plain")
+
+
+
+    elif state == "LIST_EDIT":
+
+        print(f"unedited input {text}")
+
+        inputs = text.split('*', 3)
+        print(f"THE INPUTS: {inputs}.")
+        if len(inputs) > 1:
+            updated_items = inputs[3]
+            print(f"THE updated_items: {updated_items}.")
+            # Update the list name for the object with the matching session_id
+            obj = get_object_or_404(ShoppingList, session_id=session_id)
+            print(f"THE obj: {obj}.")
+            obj.list_name = updated_items
+            obj.save()
+            response = "END List updated successfully.\n"
+            return HttpResponse(response, content_type="text/plain")
+
+
+
+
 
 
 
