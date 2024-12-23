@@ -1,12 +1,14 @@
 from http.client import responses
 
 from django.http import HttpResponse
-from.models import ShoppingList
+from.models import ShoppingList, UserInfo
 from django.shortcuts import redirect, get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
-from django.urls import reverse
-import urllib.parse
+import uuid
 
+
+def create_order_id():
+    return f"{uuid.uuid4().hex[:8].upper()}"
 
 from django.core.cache import cache
 
@@ -30,10 +32,10 @@ def update_session_state(session_id, state):
 def ussd(request):
 
     # Get the USSD request parameters
+    global obj_to_edit
     session_id = request.POST.get('sessionId')
     phone_number = request.POST.get('phoneNumber')
     text = request.POST.get('text')
-    payload = request.POST.dict()
 
     # check the current state of the session.
     state = get_session_state(session_id)
@@ -54,40 +56,126 @@ def ussd(request):
             return HttpResponse(response)
 
     elif state == "MENU_SELECTED":
+
+        # Create New Shopping List
         if text == "1":
             response = "CON Enter list name :\n"
             response += "eg. rice 4kg, fish 3kg, milk 1tin"
             update_session_state(session_id, "WAITING_FOR_LIST_NAME")
             return HttpResponse(response, content_type="text/plain")
+
+        # Use Previous List
         elif text == "2":
-            all_lists = ShoppingList.objects.filter(phone_number=phone_number)
-            last_3_items = all_lists.order_by('-id')[:3]  # Get the last 3 items based on ID
-
-            response = "CON Last 3 shopping lists.\n"
-            response += f"1. {last_3_items[0]}\n"
-            response += f"2. {last_3_items[1]}\n"
-            response += f"3. {last_3_items[2]}\n"
-            update_session_state(session_id, "PREVIOUS_LIST")
-
+            obj = ShoppingList.objects.filter(phone_number=phone_number).first()
+            if obj:
+                all_lists = ShoppingList.objects.filter(phone_number=phone_number)
+                if len(all_lists) >= 3:
+                    last_3_items = all_lists.order_by('-created_at')[:3]  # Get the last 3 items based on ID
+                    response = "CON Last 3 shopping lists.\n"
+                    response += f"1. {last_3_items[0]}\n"
+                    response += f"2. {last_3_items[1]}\n"
+                    response += f"3. {last_3_items[2]}\n"
+                    update_session_state(session_id, "PREVIOUS_LIST")
+                    return HttpResponse(response, content_type="text/plain")
+                elif len(all_lists) == 2:
+                    last_2_items = all_lists.order_by('-created_at')[:2]
+                    response = "CON Last 2 shopping lists.\n"
+                    response += f"1. {last_2_items[0]}\n"
+                    response += f"2. {last_2_items[1]}\n"
+                    update_session_state(session_id, "PREVIOUS_LIST")
+                    return HttpResponse(response, content_type="text/plain")
+                else:
+                    last_1_items = all_lists.order_by('-created_at')[:1]
+                    response = "CON Last  shopping lists.\n"
+                    response += f"1. {last_1_items[0]}\n"
+                    update_session_state(session_id, "PREVIOUS_LIST")
+                    return HttpResponse(response, content_type="text/plain")
+            else:
+                response = "END No lists Available"
+                return HttpResponse(response, content_type="text/plain")
+        # Track Order
+        elif text == "3":
+            update_session_state(session_id, "ORDER_ID")
+            response = "CON please enter your Order_ID:\n"
             return HttpResponse(response, content_type="text/plain")
+        # Manage Account
+        elif text == "4":
+            update_session_state(session_id, "ACCOUNT")
+            response = "CON Please update your Account:\n"
+            response += "1. Update Delivery Address\n"
+            response += "2. Change Payment Preference\n"
+            response += "3. View Profile\n"
+            return HttpResponse(response, content_type="text/plain")
+
+
+
+
+    elif state == "ACCOUNT":
+        update_session_state(session_id, "DIGITAL_ADDRESS_ENTERED")
+        full_text = text.split("*")
+        actual_option = full_text[1]
+        if actual_option == "1":
+
+            response = "CON Enter your new Digital Address:"
+            return HttpResponse(response, content_type="text/plain")
+
+    elif state == "DIGITAL_ADDRESS_ENTERED":
+        update_session_state(session_id, "AREA_NAME_ENTERED")
+        all_text = text.split("*", 2)
+        digital_address = all_text[2]
+        obj = UserInfo.objects.filter(phone_number=phone_number).first()
+        if obj:
+            obj.digital_address = digital_address
+            obj.save()
         else:
-            response = "END Invalid input.\n"
+            UserInfo.objects.create(
+                digital_address=digital_address,
+                phone_number=phone_number,
+            )
+
+        response = "CON Please Enter Area Name:\n"
+        return HttpResponse(response, content_type="text/plain")
+
+    elif state == "AREA_NAME_ENTERED":
+        print(f"this is the area name{text}")
+        all_text = text.split("*", 3)
+        area_name = all_text[3]
+        obj = UserInfo.objects.filter(phone_number=phone_number).first()
+        obj.area_name = area_name
+        obj.save()
+        response = "END Success! Address updated:\n"
+        return HttpResponse(response, content_type="text/plain")
+
+
+
+
+    elif state == "ORDER_ID":
+        all_text = text.split("*")
+        id_in_text = all_text[1]
+        obj = ShoppingList.objects.filter(order_id=id_in_text).first()
+        if obj:
+            if obj.phone_number == phone_number:
+                response = f"END Order Status: {obj.status}"
+                return HttpResponse(response, content_type="text/plain")
+            else:
+                response = "END phone numbers do not match"
+                return HttpResponse(response, content_type="text/plain")
+        else:
+            response = "END Invalid Order ID"
             return HttpResponse(response, content_type="text/plain")
+
 
     elif state == "PREVIOUS_LIST":
         update_session_state(session_id, "ORDER_THIS_LIST")
-        selected_option = text.split('*')
 
+        selected_option = text.split('*')
         actual_option =selected_option[1]
+
         all_lists = ShoppingList.objects.filter(phone_number=phone_number)
-        last_3_items = all_lists.order_by('created_at')[:3]  # Get the last 3 items based on ID
+        last_3_items = all_lists.order_by('-created_at')[:3]  # Get the last 3 items based on ID
 
         if actual_option == "1":
-            ShoppingList.objects.create(
-                session_id=session_id,
-                phone_number=phone_number,
-                list_name=last_3_items[0]
-            )
+
             response = "CON Order this list? .\n"
             response += f"{last_3_items[0]}\n"
             update_session_state(session_id, "ORDER_THIS_LIST")
@@ -97,11 +185,7 @@ def ussd(request):
             return HttpResponse(response, content_type="text/plain")
 
         elif actual_option == "2":
-            ShoppingList.objects.create(
-                session_id=session_id,
-                phone_number=phone_number,
-                list_name=last_3_items[1]
-            )
+
             response = "CON Order this list? .\n"
             response += f"{last_3_items[1]}\n"
             response += "1. Confirm \n"
@@ -111,11 +195,7 @@ def ussd(request):
 
 
         elif actual_option == "3":
-            ShoppingList.objects.create(
-                session_id=session_id,
-                phone_number=phone_number,
-                list_name=last_3_items[2]
-            )
+
             response = "CON Order this list? .\n"
             response += f"{last_3_items[2]}\n"
             response += "1. Confirm \n"
@@ -125,17 +205,76 @@ def ussd(request):
 
 
     elif state == "ORDER_THIS_LIST":
+        update_session_state(session_id, "THIS_LIST_ORDERED")
+
+        all_lists = ShoppingList.objects.filter(phone_number=phone_number)
+        last_3_items = all_lists.order_by('-created_at')[:3]
+
         number = text.split('*', 2)
         actual_option =number[-1]
 
         if actual_option == "1":
-            response = "END List Ordered Successfully .\n"
-            return HttpResponse(response, content_type="text/plain")
+            chosen_list = text.split('*', 3)
+            actual_chosen_list = chosen_list[1]
+            if actual_chosen_list == "1":
+                ShoppingList.objects.create(
+                    session_id=session_id,
+                    phone_number=phone_number,
+                    list_name=last_3_items[0],
+                    order_id=create_order_id()
+                )
+                obj = ShoppingList.objects.get(session_id=session_id)
+                response = "END List Ordered Successfully .\n"
+                response += "Order ID:\n"
+                response += f"{obj.order_id}\n"
+                response += "Please write it down \n"
+                return HttpResponse(response, content_type="text/plain")
+            elif actual_chosen_list == "2":
+                ShoppingList.objects.create(
+                    session_id=session_id,
+                    phone_number=phone_number,
+                    list_name=last_3_items[1],
+                    order_id=create_order_id()
+                )
+                obj = ShoppingList.objects.get(session_id=session_id)
+                response = "END List Ordered Successfully .\n"
+                response += "Order ID:\n"
+                response += f"{obj.order_id}\n"
+                response += "Please write it down \n"
+                return HttpResponse(response, content_type="text/plain")
+            elif actual_chosen_list == "3":
+                ShoppingList.objects.create(
+                    session_id=session_id,
+                    phone_number=phone_number,
+                    list_name=last_3_items[2],
+                    order_id=create_order_id()
+                )
+                obj = ShoppingList.objects.get(session_id=session_id)
+                response = "END List Ordered Successfully .\n"
+                response += "Order ID:\n"
+                response += f"{obj.order_id}\n"
+                response += "Please write it down \n"
+                return HttpResponse(response, content_type="text/plain")
+            else:
+                response = "END Invalid selection"
+                return HttpResponse(response)
 
+        # editing a list
         elif actual_option == "2":
-            update_session_state(session_id, "EDITED_PREVIOUS_LIST")
-            response = "CON Please make changes .\n"
-            response += "eg. rice 4kg, fish 3kg, milk 1tin.\n"
+            update_session_state(session_id, "CONTAINS_EDITED_LIST")
+            selected_option = text.split('*', 3)
+            item_to_edit =selected_option[1]
+            if item_to_edit == "1":
+                obj_to_edit = last_3_items[0]
+            if item_to_edit == "2":
+                obj_to_edit = last_3_items[1]
+            if item_to_edit == "3":
+                obj_to_edit = last_3_items[2]
+
+
+            response = "CON Please edit list and order .\n"
+            response += f"({obj_to_edit}).\n"
+            response += f"Edit list: \n"
             return HttpResponse(response, content_type="text/plain")
 
 
@@ -147,12 +286,31 @@ def ussd(request):
             response = "END Invalid input.\n"
             return HttpResponse(response, content_type="text/plain")
 
+    elif state == "CONTAINS_EDITED_LIST":
+        print(f"text is here: {text}")
+        all_text = text.split('*', 3)
+        new_list = all_text[3]
+        ShoppingList.objects.create(
+            session_id=session_id,
+            phone_number=phone_number,
+            list_name=new_list,
+            order_id=create_order_id()
+        )
+        obj = ShoppingList.objects.get(session_id=session_id)
+        order_id=obj.order_id
+        response = "END Order Placed Successfully!  .\n"
+        response += f"Order ID: {order_id}\n"
+        response += f"Please write it down \n"
+        return HttpResponse(response, content_type="text/plain")
+
+
+
     elif state == "EDITED_PREVIOUS_LIST":
-        print(f"the current state is {state}")
+
         edited_stuff = text.split('*', 3)
-        print(f"the edited stuff is {edited_stuff}")
+
         final_stuff = edited_stuff[3]
-        print(f"the final stuff is {final_stuff}")
+
         obj = get_object_or_404(ShoppingList, session_id=session_id)
         obj.list_name = final_stuff
         obj.save()
@@ -162,15 +320,17 @@ def ussd(request):
 
 
 
-    elif state == "WAITING_FOR_LIST_NAME":
 
+
+    elif state == "WAITING_FOR_LIST_NAME":
         inputs = text.split('*')
         if len(inputs) > 1:
             items = inputs[1]
             ShoppingList.objects.create(
                 session_id=session_id,
                 phone_number=phone_number,
-                list_name=items
+                list_name=items,
+                order_id=create_order_id()
                 )
         else:
             response = "END list not made.\n"
@@ -184,18 +344,26 @@ def ussd(request):
         return HttpResponse(response, content_type="text/plain")
 
     elif state == "DISPLAY_LIST":
+        obj= get_object_or_404(ShoppingList, session_id=session_id)
+        order_id = obj.order_id
 
         inputs = text.split('*')
         selected_option = inputs[-1]
         if selected_option == "1":
-
-            response = "END Items saved :\n"
+            response = "END Items Added Successfully:\n"
+            response += f"your order id: \n"
+            response += f"{order_id} \n"
+            response += "Please write it down \n"
             return HttpResponse(response, content_type="text/plain")
 
         elif selected_option == "2":
+            print(f"check text: {text}")
+            all_text = text.split('*', 2)
+            actual_text = all_text[1]
 
-            response = "CON Edit list :\n"
-            response += "eg. rice 4kg, fish 3kg, milk 1tin"
+            response = "CON Edit your list and Order :\n"
+            response += f"({actual_text})\n"
+            response += f"Edit list: \n"
             update_session_state(session_id, "LIST_EDIT")
             return HttpResponse(response, content_type="text/plain")
         elif selected_option == "3":
@@ -214,7 +382,10 @@ def ussd(request):
 
             obj.list_name = updated_items
             obj.save()
-            response = "END List updated successfully.\n"
+            order_id=obj.order_id
+            response = "END List updated & Ordered successfully! .\n"
+            response += f"Order ID: {order_id}\n"
+            response += f"please keep order_ID safe\n"
             return HttpResponse(response, content_type="text/plain")
 
 
@@ -239,35 +410,6 @@ def ussd(request):
 
 
 
-
-    elif text == "1":
-        return create_new_shopping_list_1(payload)
-
-
-    elif text == "2":
-        response = "CON last three lists:\n"
-        response += "1. [List Date: 12/12/2024] \n"
-        response += "2. [List Date: 10/12/2024] \n"
-        response += "3. [List Date: 08/12/2024] \n"
-
-    else:
-        response = "END Invalid selection."
-
-    return HttpResponse(response, content_type='text/plain')
-
-
-def create_new_shopping_list_1(payload):
-    # Process payload
-    session_id = payload.get('sessionId')
-    phone_number = payload.get('phoneNumber')
-    text = payload.get('text')
-
-    # Example response
-    response = "CON Enter the name of your shopping list:\n"
-    response += "Enter your input \n"
-    input_data = response.data
-
-    return HttpResponse(response, content_type="text/plain")
 
 
 
