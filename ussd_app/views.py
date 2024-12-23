@@ -1,8 +1,6 @@
-from http.client import responses
-
 from django.http import HttpResponse
 from.models import ShoppingList, UserInfo
-from django.shortcuts import redirect, get_object_or_404
+from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 import uuid
 
@@ -12,8 +10,8 @@ def create_order_id():
 
 from django.core.cache import cache
 
-# Default timeout for session states (in seconds)
-SESSION_TIMEOUT = 900  # 5 minutes
+
+
 
 def get_session_state(session_id):
     """
@@ -23,7 +21,7 @@ def get_session_state(session_id):
     return cache.get(session_id, "START")
 
 def update_session_state(session_id, state):
-    cache.set(session_id, state, timeout=SESSION_TIMEOUT)
+    cache.set(session_id, state)
 
 
 
@@ -48,12 +46,12 @@ def ussd(request):
             response += "3. Track Order\n"
             response += "4. Manage Account\n"
             response += "5. Help\n"
-            response += "0. Exit\n"
+
             update_session_state(session_id, "MENU_SELECTED")
             return HttpResponse(response)
         else:
-            response = "Invalid selection"
-            return HttpResponse(response)
+            response = "END Invalid selection"
+            return HttpResponse(response, content_type="text/plain")
 
     elif state == "MENU_SELECTED":
 
@@ -102,27 +100,106 @@ def ussd(request):
         elif text == "4":
             update_session_state(session_id, "ACCOUNT")
             response = "CON Please update your Account:\n"
-            response += "1. Update Delivery Address\n"
+            response += "1. Update Name, Delivery Address & Area Name\n"
             response += "2. Change Payment Preference\n"
             response += "3. View Profile\n"
+            return HttpResponse(response, content_type="text/plain")
+        elif text == "5":
+            response = "END customer support \n"
+            response += "030 xxx-xxx-x"
+            return HttpResponse(response, content_type="text/plain")
+        else:
+            response = "END Invalid selection"
             return HttpResponse(response, content_type="text/plain")
 
 
 
 
     elif state == "ACCOUNT":
-        update_session_state(session_id, "DIGITAL_ADDRESS_ENTERED")
         full_text = text.split("*")
         actual_option = full_text[1]
-        if actual_option == "1":
 
-            response = "CON Enter your new Digital Address:"
+        # Update Delivery Address
+        if actual_option == "1":
+            update_session_state(session_id, "ENTERED_NAME")
+            response = "CON Enter your Name:"
             return HttpResponse(response, content_type="text/plain")
 
-    elif state == "DIGITAL_ADDRESS_ENTERED":
-        update_session_state(session_id, "AREA_NAME_ENTERED")
+        # Change Payment Preference
+        elif actual_option == "2":
+            update_session_state(session_id, "PAYMENT_PREFERENCE")
+            response = "CON Choose Payment Preference: \n"
+            response += "1. MTN MoMo \n"
+            response += "2. Vodafone Cash \n"
+            return HttpResponse(response, content_type="text/plain")
+
+        # View Profile
+        elif actual_option == "3":
+            obj = UserInfo.objects.filter(phone_number=phone_number).first()
+            if obj:
+                name = obj.name
+                phone_number = obj.phone_number
+                digital_address = obj.digital_address
+                area_name= obj.area_name
+                response = f"END Name :{name}\n Phone Number:{phone_number}\n Digital Address:{digital_address} \n Area Name: {area_name}"
+                return HttpResponse(response, content_type="text/plain")
+            else:
+                response = "END Please create an account"
+                return HttpResponse(response, content_type="text/plain")
+
+    # payment options
+    elif state == "PAYMENT_PREFERENCE":
+        print(f"payment method number in text: {text}")
+        full_text = text.split("*", 2)
+        actual_option = full_text[2]
+        if actual_option == "1":
+            obj = UserInfo.objects.filter(phone_number=phone_number).first()
+            if obj:
+                obj.payment_preference = "MTN MoMo"
+                obj.save()
+                response = "END Success! Payment Preference Updated\n"
+                return HttpResponse(response, content_type="text/plain")
+            else:
+                response = "END please update Digital Address first: \n"
+                return HttpResponse(response, content_type="text/plain")
+        elif actual_option == "2":
+            obj = UserInfo.objects.filter(phone_number=phone_number).first()
+            if obj:
+                obj.payment_preference = "Vodafone Cash"
+                obj.save()
+                response = "END Success! Payment Preference Updated:\n:"
+                return HttpResponse(response, content_type="text/plain")
+            else:
+                response = "END please update Digital Address first: \n"
+                return HttpResponse(response, content_type="text/plain")
+        else:
+            response = "END Invalid selection: \n"
+            return HttpResponse(response, content_type="text/plain")
+
+
+
+
+    elif state == "ENTERED_NAME":
+        update_session_state(session_id, "DIGITAL_ADDRESS_ENTERED")
+        print(f"this is the real name in text: {text}")
         all_text = text.split("*", 2)
-        digital_address = all_text[2]
+        real_name = all_text[2]
+
+        obj = UserInfo.objects.filter(phone_number=phone_number).first()
+        if obj:
+            obj.name = real_name
+            obj.save()
+        else:
+            UserInfo.objects.create(name=real_name, phone_number=phone_number)
+
+        response = "CON Please Enter Digital Address:\n"
+        return HttpResponse(response, content_type="text/plain")
+
+    elif state == "DIGITAL_ADDRESS_ENTERED":
+        print(f"this is the real text again in text: {text}")
+        update_session_state(session_id, "AREA_NAME_ENTERED")
+        all_text = text.split("*", 3)
+        digital_address = all_text[3]
         obj = UserInfo.objects.filter(phone_number=phone_number).first()
         if obj:
             obj.digital_address = digital_address
@@ -138,8 +215,8 @@ def ussd(request):
 
     elif state == "AREA_NAME_ENTERED":
         print(f"this is the area name{text}")
-        all_text = text.split("*", 3)
-        area_name = all_text[3]
+        all_text = text.split("*", 4)
+        area_name = all_text[4]
         obj = UserInfo.objects.filter(phone_number=phone_number).first()
         obj.area_name = area_name
         obj.save()

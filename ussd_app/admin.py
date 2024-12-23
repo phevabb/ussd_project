@@ -9,4 +9,4 @@ class ShoppingListAdmin(admin.ModelAdmin):
 # Register your models here.
 @admin.register(UserInfo)
 class UserInfoAdmin(admin.ModelAdmin):
-    list_display = ('phone_number','digital_address', 'area_name', 'payment_preference')
+    list_display = ('name', 'phone_number','digital_address', 'area_name', 'payment_preference')
