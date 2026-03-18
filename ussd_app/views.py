@@ -1,492 +1,378 @@
-from django.http import HttpResponse
-from.models import ShoppingList, UserInfo
-from django.shortcuts import get_object_or_404
+from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-import uuid
-
-
-def create_order_id():
-    return f"{uuid.uuid4().hex[:8].upper()}"
-
+from django.db import transaction
 from django.core.cache import cache
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from datetime import timedelta
+from .models import Passenger, Route, Trip, Reservation, Payment
+
+SESSION_TIMEOUT = 15 * 60  # 15 minutes
+SEAT_PAGE_SIZE = 4         # show 4 seats per page like your example
+
+def get_state(session_id, default="START"):
+    return cache.get(f"{session_id}:state", default)
+
+def set_state(session_id, state):
+    cache.set(f"{session_id}:state", state, SESSION_TIMEOUT)
+
+def get_data(session_id):
+    return cache.get(f"{session_id}:data", {})
+
+def set_data(session_id, data):
+    cache.set(f"{session_id}:data", data, SESSION_TIMEOUT)
+
+def end(text):
+    return HttpResponse(f"END {text}", content_type="text/plain")
+
+def cont(text):
+    return HttpResponse(f"CON {text}", content_type="text/plain")
 
 
+def ensure_passenger(phone_number):
+    p, _ = Passenger.objects.get_or_create(phone_number=phone_number)
+    return p
 
 
-def get_session_state(session_id):
-    """
-    Retrieve the session state for a given session ID.
-    Defaults to 'START' if no state is found.
-    """
-    return cache.get(session_id, "START")
+def ensure_trip(route_id, window, dep_time_str):
+    """Get or create today's trip for route/window/time."""
+    route = get_object_or_404(Route, id=route_id)
+    service_date = timezone.localdate()
+    # Parse simple HH:MM string
+    hour, minute = map(int, dep_time_str.split(":"))
+    from datetime import time as t
+    return Trip.objects.get_or_create(
+        route=route,
+        service_date=service_date,
+        window=window,
+        departure_time=t(hour, minute),
+        defaults={"capacity": 36}
+    )[0]
 
-def update_session_state(session_id, state):
-    cache.set(session_id, state)
+
+def list_routes_text():
+    routes = Route.objects.all().order_by("id")
+    lines = []
+    for idx, r in enumerate(routes, start=1):
+        lines.append(f"{idx}. {r.origin} ➡ {r.destination}")
+    return "\n".join(lines), list(routes)
 
 
+def list_times_text(window):
+    # Mirror your example
+    times = ["05:30", "06:00", "06:30"]
+    title = "Select Departure Time" if window == Trip.MORNING else "Select Departure Time"
+    lines = [title]
+    for i, t in enumerate(times, start=1):
+        lines.append(f"{i}. {t}")
+    return "\n".join(lines), times
+
+
+def format_confirm_screen(route, time_str, seat, price):
+    return (
+        "Confirm Booking\n"
+        f"Route: {route.origin} – {route.destination}\n"
+        f"Time: {time_str}\n"
+        f"Seat: {seat}\n"
+        f"Price: {int(price) if price == int(price) else price}\n"
+        "1. Confirm & Pay (MoMo)\n"
+        "2. Cancel"
+    )
 
 
 @csrf_exempt
 def ussd(request):
+    session_id = request.POST.get("sessionId")
+    phone_number = request.POST.get("phoneNumber")
+    text = request.POST.get("text") or ""
+    steps = text.split("*") if text else []
+    last = steps[-1] if steps else ""
 
-    # Get the USSD request parameters
-    global obj_to_edit
-    session_id = request.POST.get('sessionId')
-    phone_number = request.POST.get('phoneNumber')
-    text = request.POST.get('text')
+    state = get_state(session_id)
+    data = get_data(session_id)
 
-    # check the current state of the session.
-    state = get_session_state(session_id)
-
+    # START / MAIN MENU
     if state == "START":
-        if text == "":
-            response = "CON Welcome to Friend's Market\n"
-            response += "1. Create New Shopping List\n"
-            response += "2. Use Previous List\n"
-            response += "3. Track Order\n"
-            response += "4. Manage Account\n"
-            response += "5. Help\n"
+        set_state(session_id, "MAIN_MENU")
+        menu = (
+            "Welcome to Smart Shuttle\n"
+            "1. Morning & Evening Shuttle Services\n"
+            "2. Check Schedule\n"
+            "3. My Reservation\n"
+            "4. Cancel Reservation\n"
+            "5. Help"
+        )
+        return cont(menu)
 
-            update_session_state(session_id, "MENU_SELECTED")
-            return HttpResponse(response)
+    # MAIN MENU HANDLER
+    if state == "MAIN_MENU":
+        if last == "1":
+            set_state(session_id, "BOOK_MENU")
+            return cont(
+                "1. Book Morning Shuttle Service\n"
+                "2. Book Evening Shuttle Service"
+            )
+        elif last == "2":
+            set_state(session_id, "CHECK_SCHEDULE")
+            # Show routes, then times
+            routes_txt, _ = list_routes_text()
+            return cont("Select Route\n" + routes_txt)
+        elif last == "3":
+            # My Reservation (last confirmed)
+            passenger = ensure_passenger(phone_number)
+            r = (Reservation.objects
+                 .filter(passenger=passenger, status=Reservation.CONFIRMED)
+                 .order_by("-created_at").first())
+            if not r:
+                return end("No confirmed reservation found.")
+            trip = r.trip
+            t = trip.departure_time.strftime("%H:%M")
+            return end(
+                "Ticket Details:\n"
+                f"{trip.route.origin} - {trip.route.destination}\n"
+                f"Time: {t}\n"
+                f"Seat: {r.seat_number}\n"
+                f"Reservation Code: {r.reservation_code}"
+            )
+        elif last == "4":
+            set_state(session_id, "CANCEL_FLOW_ROUTE")
+            routes_txt, _ = list_routes_text()
+            return cont("Cancel Reservation\nSelect Route\n" + routes_txt)
+        elif last == "5":
+            return end("Help: Dial *100*224# to book. For support call 030 xxxxxxx.")
         else:
-            response = "END Invalid selection"
-            return HttpResponse(response, content_type="text/plain")
+            return end("Invalid selection.")
 
-    elif state == "MENU_SELECTED":
+    # BOOK MENU (Morning/Evening)
+    if state == "BOOK_MENU":
+        if last == "1":
+            data.update({"window": Trip.MORNING})
+        elif last == "2":
+            data.update({"window": Trip.EVENING})
+        else:
+            return end("Invalid selection.")
+        set_data(session_id, data)
+        set_state(session_id, "SELECT_ROUTE")
+        routes_txt, _ = list_routes_text()
+        return cont("Select Route\n" + routes_txt)
 
-        # Create New Shopping List
-        if text == "1":
-            response = "CON Enter list name :\n"
-            response += "eg. rice 4kg, fish 3kg, milk 1tin"
-            update_session_state(session_id, "WAITING_FOR_LIST_NAME")
-            return HttpResponse(response, content_type="text/plain")
+    # SELECT ROUTE
+    if state == "SELECT_ROUTE":
+        try:
+            idx = int(last) - 1
+        except ValueError:
+            return end("Invalid selection.")
 
-        # Use Previous List
-        elif text == "2":
-            obj = ShoppingList.objects.filter(phone_number=phone_number).first()
-            if obj:
-                all_lists = ShoppingList.objects.filter(phone_number=phone_number)
-                if len(all_lists) >= 3:
-                    last_3_items = all_lists.order_by('-created_at')[:3]  # Get the last 3 items based on ID
-                    response = "CON Last 3 shopping lists.\n"
-                    response += f"1. {last_3_items[0]}\n"
-                    response += f"2. {last_3_items[1]}\n"
-                    response += f"3. {last_3_items[2]}\n"
-                    update_session_state(session_id, "PREVIOUS_LIST")
-                    return HttpResponse(response, content_type="text/plain")
-                elif len(all_lists) == 2:
-                    last_2_items = all_lists.order_by('-created_at')[:2]
-                    response = "CON Last 2 shopping lists.\n"
-                    response += f"1. {last_2_items[0]}\n"
-                    response += f"2. {last_2_items[1]}\n"
-                    update_session_state(session_id, "PREVIOUS_LIST")
-                    return HttpResponse(response, content_type="text/plain")
-                else:
-                    last_1_items = all_lists.order_by('-created_at')[:1]
-                    response = "CON Last  shopping lists.\n"
-                    response += f"1. {last_1_items[0]}\n"
-                    update_session_state(session_id, "PREVIOUS_LIST")
-                    return HttpResponse(response, content_type="text/plain")
+        routes_txt, routes = list_routes_text()
+        if not (0 <= idx < len(routes)):
+            return end("Invalid selection.")
+
+        route = routes[idx]
+        data.update({"route_id": route.id})
+        set_data(session_id, data)
+
+        set_state(session_id, "SELECT_TIME")
+        times_txt, _ = list_times_text(data["window"])
+        return cont(times_txt)
+
+    # SELECT TIME
+    if state == "SELECT_TIME":
+        times_txt, times = list_times_text(data["window"])
+        try:
+            idx = int(last) - 1
+        except ValueError:
+            return end("Invalid selection.")
+        if not (0 <= idx < len(times)):
+            return end("Invalid selection.")
+
+        time_str = times[idx]
+        data.update({"time_str": time_str})
+        set_data(session_id, data)
+
+        # Build available seats & show first page
+        trip = ensure_trip(data["route_id"], data["window"], time_str)
+        av = trip.available_seats()
+        if not av:
+            set_state(session_id, "MAIN_MENU")
+            return end("Sorry, this trip is fully booked.")
+
+        data["seat_page"] = 0
+        data["available_seats"] = av  # cache now for paging
+        set_data(session_id, data)
+        set_state(session_id, "SELECT_SEAT")
+        return cont(render_seat_page(data))
+
+    # SELECT SEAT (with paging)
+    if state == "SELECT_SEAT":
+        av = data.get("available_seats", [])
+        page = data.get("seat_page", 0)
+        page_count = (len(av) + SEAT_PAGE_SIZE - 1) // SEAT_PAGE_SIZE
+        start = page * SEAT_PAGE_SIZE
+        end_i = start + SEAT_PAGE_SIZE
+        current_slice = av[start:end_i]
+        options_count = len(current_slice)
+
+        try:
+            choice = int(last)
+        except ValueError:
+            return end("Invalid input.")
+
+        # Next page option
+        if options_count and choice == options_count + 1:
+            if page + 1 < page_count:
+                data["seat_page"] = page + 1
+                set_data(session_id, data)
+                return cont(render_seat_page(data))
             else:
-                response = "END No lists Available"
-                return HttpResponse(response, content_type="text/plain")
-        # Track Order
-        elif text == "3":
-            update_session_state(session_id, "ORDER_ID")
-            response = "CON please enter your Order_ID:\n"
-            return HttpResponse(response, content_type="text/plain")
-        # Manage Account
-        elif text == "4":
-            update_session_state(session_id, "ACCOUNT")
-            response = "CON Please update your Account:\n"
-            response += "1. Update Name, Delivery Address & Area Name\n"
-            response += "2. Change Payment Preference\n"
-            response += "3. View Profile\n"
-            return HttpResponse(response, content_type="text/plain")
-        elif text == "5":
-            response = "END customer support \n"
-            response += "030 xxx-xxx-x"
-            return HttpResponse(response, content_type="text/plain")
+                return end("No more seats.")
+        # Seat picked
+        elif 1 <= choice <= options_count:
+            seat_number = current_slice[choice - 1]
+            data["seat_number"] = seat_number
+            set_data(session_id, data)
+
+            # Prepare confirmation screen
+            route = Route.objects.get(id=data["route_id"])
+            price = route.price
+            confirm_text = format_confirm_screen(route, data["time_str"], seat_number, price)
+            set_state(session_id, "CONFIRM_BOOKING")
+            return cont(confirm_text)
         else:
-            response = "END Invalid selection"
-            return HttpResponse(response, content_type="text/plain")
+            return end("Invalid selection.")
 
+    # CONFIRM_BOOKING
+    if state == "CONFIRM_BOOKING":
+        if last == "1":  # Confirm & Pay
+            passenger = ensure_passenger(phone_number)
+            route = Route.objects.get(id=data["route_id"])
+            trip = ensure_trip(data["route_id"], data["window"], data["time_str"])
+            seat_number = data["seat_number"]
+            hold_for = timezone.now() + timedelta(minutes=5)
 
+            # Atomic hold of the seat
+            try:
+                with transaction.atomic():
+                    # Double-check seat availability at commit time
+                    if seat_number in trip.taken_seats():
+                        set_state(session_id, "MAIN_MENU")
+                        return end("Seat just got taken. Please try another seat.")
+                    res = Reservation.objects.create(
+                        passenger=passenger,
+                        trip=trip,
+                        seat_number=seat_number,
+                        amount=route.price,
+                        status=Reservation.HELD,
+                        hold_expires_at=hold_for,
+                    )
+                    # Create a pending payment (provider could depend on passenger preference)
+                    provider = passenger.payment_preference or Payment.MTN
+                    Payment.objects.create(
+                        reservation=res,
+                        provider=provider,
+                        amount=route.price,
+                        status=Payment.PENDING
+                    )
+            except Exception:
+                return end("Could not place hold. Please try again.")
 
-
-    elif state == "ACCOUNT":
-        full_text = text.split("*")
-        actual_option = full_text[1]
-
-        # Update Delivery Address
-        if actual_option == "1":
-            update_session_state(session_id, "ENTERED_NAME")
-            response = "CON Enter your Name:"
-            return HttpResponse(response, content_type="text/plain")
-
-        # Change Payment Preference
-        elif actual_option == "2":
-            update_session_state(session_id, "PAYMENT_PREFERENCE")
-            response = "CON Choose Payment Preference: \n"
-            response += "1. MTN MoMo \n"
-            response += "2. Vodafone Cash \n"
-            return HttpResponse(response, content_type="text/plain")
-
-        # View Profile
-        elif actual_option == "3":
-            obj = UserInfo.objects.filter(phone_number=phone_number).first()
-            if obj:
-                name = obj.name
-                phone_number = obj.phone_number
-                digital_address = obj.digital_address
-                area_name= obj.area_name
-                response = f"END Name :{name}\n Phone Number:{phone_number}\n Digital Address:{digital_address} \n Area Name: {area_name}"
-                return HttpResponse(response, content_type="text/plain")
-            else:
-                response = "END Please create an account"
-                return HttpResponse(response, content_type="text/plain")
-
-    # payment options
-    elif state == "PAYMENT_PREFERENCE":
-        print(f"payment method number in text: {text}")
-        full_text = text.split("*", 2)
-        actual_option = full_text[2]
-        if actual_option == "1":
-            obj = UserInfo.objects.filter(phone_number=phone_number).first()
-            if obj:
-                obj.payment_preference = "MTN MoMo"
-                obj.save()
-                response = "END Success! Payment Preference Updated\n"
-                return HttpResponse(response, content_type="text/plain")
-            else:
-                response = "END please update Digital Address first: \n"
-                return HttpResponse(response, content_type="text/plain")
-        elif actual_option == "2":
-            obj = UserInfo.objects.filter(phone_number=phone_number).first()
-            if obj:
-                obj.payment_preference = "Vodafone Cash"
-                obj.save()
-                response = "END Success! Payment Preference Updated:\n:"
-                return HttpResponse(response, content_type="text/plain")
-            else:
-                response = "END please update Digital Address first: \n"
-                return HttpResponse(response, content_type="text/plain")
-        else:
-            response = "END Invalid selection: \n"
-            return HttpResponse(response, content_type="text/plain")
-
-
-
-
-    elif state == "ENTERED_NAME":
-        update_session_state(session_id, "DIGITAL_ADDRESS_ENTERED")
-        print(f"this is the real name in text: {text}")
-        all_text = text.split("*", 2)
-        real_name = all_text[2]
-
-        obj = UserInfo.objects.filter(phone_number=phone_number).first()
-        if obj:
-            obj.name = real_name
-            obj.save()
-        else:
-            UserInfo.objects.create(name=real_name, phone_number=phone_number)
-
-        response = "CON Please Enter Digital Address:\n"
-        return HttpResponse(response, content_type="text/plain")
-
-    elif state == "DIGITAL_ADDRESS_ENTERED":
-        print(f"this is the real text again in text: {text}")
-        update_session_state(session_id, "AREA_NAME_ENTERED")
-        all_text = text.split("*", 3)
-        digital_address = all_text[3]
-        obj = UserInfo.objects.filter(phone_number=phone_number).first()
-        if obj:
-            obj.digital_address = digital_address
-            obj.save()
-        else:
-            UserInfo.objects.create(
-                digital_address=digital_address,
-                phone_number=phone_number,
+            # TODO: Integrate MoMo push here (PSP API call) and redirect to callback.
+            # For USSD, we end the session and send an SMS on payment success.
+            set_state(session_id, "MAIN_MENU")
+            return end(
+                "Payment prompt sent. Please approve on your phone.\n"
+                "You will receive an SMS with your ticket after successful payment."
             )
 
-        response = "CON Please Enter Area Name:\n"
-        return HttpResponse(response, content_type="text/plain")
-
-    elif state == "AREA_NAME_ENTERED":
-        print(f"this is the area name{text}")
-        all_text = text.split("*", 4)
-        area_name = all_text[4]
-        obj = UserInfo.objects.filter(phone_number=phone_number).first()
-        obj.area_name = area_name
-        obj.save()
-        response = "END Success! Address updated:\n"
-        return HttpResponse(response, content_type="text/plain")
-
-
-
-
-    elif state == "ORDER_ID":
-        all_text = text.split("*")
-        id_in_text = all_text[1]
-        obj = ShoppingList.objects.filter(order_id=id_in_text).first()
-        if obj:
-            if obj.phone_number == phone_number:
-                response = f"END Order Status: {obj.status}"
-                return HttpResponse(response, content_type="text/plain")
-            else:
-                response = "END phone numbers do not match"
-                return HttpResponse(response, content_type="text/plain")
+        elif last == "2":
+            set_state(session_id, "MAIN_MENU")
+            return end("Reservation cancelled.")
         else:
-            response = "END Invalid Order ID"
-            return HttpResponse(response, content_type="text/plain")
+            return end("Invalid selection.")
 
+    # CHECK SCHEDULE
+    if state == "CHECK_SCHEDULE":
+        # flow: route -> time -> show available seats count
+        # If route not chosen yet:
+        if "sched_route_id" not in data:
+            try:
+                idx = int(last) - 1
+            except ValueError:
+                return end("Invalid selection.")
+            routes_txt, routes = list_routes_text()
+            if not (0 <= idx < len(routes)):
+                return end("Invalid selection.")
+            data["sched_route_id"] = routes[idx].id
+            set_data(session_id, data)
+            times_txt, _ = list_times_text(Trip.MORNING)  # same list; window neutral here
+            set_state(session_id, "CHECK_SCHEDULE_TIME")
+            return cont(times_txt)
 
-    elif state == "PREVIOUS_LIST":
-        update_session_state(session_id, "ORDER_THIS_LIST")
-
-        selected_option = text.split('*')
-        actual_option =selected_option[1]
-
-        all_lists = ShoppingList.objects.filter(phone_number=phone_number)
-        last_3_items = all_lists.order_by('-created_at')[:3]  # Get the last 3 items based on ID
-
-        if actual_option == "1":
-
-            response = "CON Order this list? .\n"
-            response += f"{last_3_items[0]}\n"
-            update_session_state(session_id, "ORDER_THIS_LIST")
-            response += "1. Confirm \n"
-            response += "2. Edit \n"
-            response += "3. Cancel"
-            return HttpResponse(response, content_type="text/plain")
-
-        elif actual_option == "2":
-
-            response = "CON Order this list? .\n"
-            response += f"{last_3_items[1]}\n"
-            response += "1. Confirm \n"
-            response += "2. Edit \n"
-            response += "3. Cancel"
-            return HttpResponse(response, content_type="text/plain")
-
-
-        elif actual_option == "3":
-
-            response = "CON Order this list? .\n"
-            response += f"{last_3_items[2]}\n"
-            response += "1. Confirm \n"
-            response += "2. Edit \n"
-            response += "3. Cancel"
-            return HttpResponse(response, content_type="text/plain")
-
-
-    elif state == "ORDER_THIS_LIST":
-        update_session_state(session_id, "THIS_LIST_ORDERED")
-
-        all_lists = ShoppingList.objects.filter(phone_number=phone_number)
-        last_3_items = all_lists.order_by('-created_at')[:3]
-
-        number = text.split('*', 2)
-        actual_option =number[-1]
-
-        if actual_option == "1":
-            chosen_list = text.split('*', 3)
-            actual_chosen_list = chosen_list[1]
-            if actual_chosen_list == "1":
-                ShoppingList.objects.create(
-                    session_id=session_id,
-                    phone_number=phone_number,
-                    list_name=last_3_items[0],
-                    order_id=create_order_id()
-                )
-                obj = ShoppingList.objects.get(session_id=session_id)
-                response = "END List Ordered Successfully .\n"
-                response += "Order ID:\n"
-                response += f"{obj.order_id}\n"
-                response += "Please write it down \n"
-                return HttpResponse(response, content_type="text/plain")
-            elif actual_chosen_list == "2":
-                ShoppingList.objects.create(
-                    session_id=session_id,
-                    phone_number=phone_number,
-                    list_name=last_3_items[1],
-                    order_id=create_order_id()
-                )
-                obj = ShoppingList.objects.get(session_id=session_id)
-                response = "END List Ordered Successfully .\n"
-                response += "Order ID:\n"
-                response += f"{obj.order_id}\n"
-                response += "Please write it down \n"
-                return HttpResponse(response, content_type="text/plain")
-            elif actual_chosen_list == "3":
-                ShoppingList.objects.create(
-                    session_id=session_id,
-                    phone_number=phone_number,
-                    list_name=last_3_items[2],
-                    order_id=create_order_id()
-                )
-                obj = ShoppingList.objects.get(session_id=session_id)
-                response = "END List Ordered Successfully .\n"
-                response += "Order ID:\n"
-                response += f"{obj.order_id}\n"
-                response += "Please write it down \n"
-                return HttpResponse(response, content_type="text/plain")
-            else:
-                response = "END Invalid selection"
-                return HttpResponse(response)
-
-        # editing a list
-        elif actual_option == "2":
-            update_session_state(session_id, "CONTAINS_EDITED_LIST")
-            selected_option = text.split('*', 3)
-            item_to_edit =selected_option[1]
-            if item_to_edit == "1":
-                obj_to_edit = last_3_items[0]
-            if item_to_edit == "2":
-                obj_to_edit = last_3_items[1]
-            if item_to_edit == "3":
-                obj_to_edit = last_3_items[2]
-
-
-            response = "CON Please edit list and order .\n"
-            response += f"({obj_to_edit}).\n"
-            response += f"Edit list: \n"
-            return HttpResponse(response, content_type="text/plain")
-
-
-        elif actual_option == "3":
-            ShoppingList.objects.filter(session_id=session_id).delete()
-            response = "END List Order Canceled .\n"
-            return HttpResponse(response, content_type="text/plain")
-        else:
-            response = "END Invalid input.\n"
-            return HttpResponse(response, content_type="text/plain")
-
-    elif state == "CONTAINS_EDITED_LIST":
-        print(f"text is here: {text}")
-        all_text = text.split('*', 3)
-        new_list = all_text[3]
-        ShoppingList.objects.create(
-            session_id=session_id,
-            phone_number=phone_number,
-            list_name=new_list,
-            order_id=create_order_id()
+    if state == "CHECK_SCHEDULE_TIME":
+        times_txt, times = list_times_text(Trip.MORNING)
+        try:
+            idx = int(last) - 1
+        except ValueError:
+            return end("Invalid selection.")
+        if not (0 <= idx < len(times)):
+            return end("Invalid selection.")
+        time_str = times[idx]
+        # Show both windows for this route & time
+        route = Route.objects.get(id=data["sched_route_id"])
+        morn = ensure_trip(route.id, Trip.MORNING, time_str)
+        eve = ensure_trip(route.id, Trip.EVENING, time_str)
+        out = (
+            f"Schedule for {route.origin} - {route.destination} at {time_str}\n"
+            f"Morning: {len(morn.available_seats())} seats available\n"
+            f"Evening: {len(eve.available_seats())} seats available"
         )
-        obj = ShoppingList.objects.get(session_id=session_id)
-        order_id=obj.order_id
-        response = "END Order Placed Successfully!  .\n"
-        response += f"Order ID: {order_id}\n"
-        response += f"Please write it down \n"
-        return HttpResponse(response, content_type="text/plain")
+        set_state(session_id, "MAIN_MENU")
+        return end(out)
+
+    # CANCEL RESERVATION FLOW (by route → show last held/confirmed → cancel)
+    if state == "CANCEL_FLOW_ROUTE":
+        try:
+            idx = int(last) - 1
+        except ValueError:
+            return end("Invalid selection.")
+        routes_txt, routes = list_routes_text()
+        if not (0 <= idx < len(routes)):
+            return end("Invalid selection.")
+        data["cancel_route_id"] = routes[idx].id
+        set_data(session_id, data)
+        set_state(session_id, "CANCEL_PICK")
+        return cont("Enter Reservation Code to cancel:")
+
+    if state == "CANCEL_PICK":
+        code = last.strip().upper()
+        passenger = ensure_passenger(phone_number)
+        res = (Reservation.objects
+               .filter(passenger=passenger, reservation_code=code)
+               .exclude(status=Reservation.CANCELLED)
+               .first())
+        if not res:
+            set_state(session_id, "MAIN_MENU")
+            return end("Reservation not found.")
+        # If payment is pending, just cancel hold. If confirmed, mark cancelled and (optionally) refund flow.
+        res.status = Reservation.CANCELLED
+        res.save()
+        set_state(session_id, "MAIN_MENU")
+        return end("Reservation cancelled.")
+
+    # default fallback
+    set_state(session_id, "MAIN_MENU")
+    return end("Session reset. Please try again.")
 
 
-
-    elif state == "EDITED_PREVIOUS_LIST":
-
-        edited_stuff = text.split('*', 3)
-
-        final_stuff = edited_stuff[3]
-
-        obj = get_object_or_404(ShoppingList, session_id=session_id)
-        obj.list_name = final_stuff
-        obj.save()
-        response = "END Selected List Successfully updated .\n"
-        return HttpResponse(response, content_type="text/plain")
-
-
-
-
-
-
-    elif state == "WAITING_FOR_LIST_NAME":
-        inputs = text.split('*')
-        if len(inputs) > 1:
-            items = inputs[1]
-            ShoppingList.objects.create(
-                session_id=session_id,
-                phone_number=phone_number,
-                list_name=items,
-                order_id=create_order_id()
-                )
-        else:
-            response = "END list not made.\n"
-            return HttpResponse(response, content_type="text/plain")
-        response = f"CON Your List:\n"
-        update_session_state(session_id, "DISPLAY_LIST")
-        response += f"Your List:({items}).\n"
-        response += "1. Confirm and Save\n"
-        response += "2. Edit\n"
-        response += "3. Cancel list\n"
-        return HttpResponse(response, content_type="text/plain")
-
-    elif state == "DISPLAY_LIST":
-        obj= get_object_or_404(ShoppingList, session_id=session_id)
-        order_id = obj.order_id
-
-        inputs = text.split('*')
-        selected_option = inputs[-1]
-        if selected_option == "1":
-            response = "END Items Added Successfully:\n"
-            response += f"your order id: \n"
-            response += f"{order_id} \n"
-            response += "Please write it down \n"
-            return HttpResponse(response, content_type="text/plain")
-
-        elif selected_option == "2":
-            print(f"check text: {text}")
-            all_text = text.split('*', 2)
-            actual_text = all_text[1]
-
-            response = "CON Edit your list and Order :\n"
-            response += f"({actual_text})\n"
-            response += f"Edit list: \n"
-            update_session_state(session_id, "LIST_EDIT")
-            return HttpResponse(response, content_type="text/plain")
-        elif selected_option == "3":
-            ShoppingList.objects.filter(session_id=session_id).delete()
-            response = "END list successfully deleted :\n"
-            return HttpResponse(response, content_type="text/plain")
-
-
-
-    elif state == "LIST_EDIT":
-
-        inputs = text.split('*', 3)
-        if len(inputs) > 1:
-            updated_items = inputs[3]            # Update the list name for the object with the matching session_id
-            obj = get_object_or_404(ShoppingList, session_id=session_id)
-
-            obj.list_name = updated_items
-            obj.save()
-            order_id=obj.order_id
-            response = "END List updated & Ordered successfully! .\n"
-            response += f"Order ID: {order_id}\n"
-            response += f"please keep order_ID safe\n"
-            return HttpResponse(response, content_type="text/plain")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def render_seat_page(data):
+    av = data["available_seats"]
+    page = data["seat_page"]
+    start = page * SEAT_PAGE_SIZE
+    end_i = start + SEAT_PAGE_SIZE
+    slice_ = av[start:end_i]
+    lines = ["Select Seat Number"]
+    for i, seat in enumerate(slice_, start=1):
+        lines.append(f"{i}. Seat {seat}")
+    # Next page
+    if end_i < len(av):
+        lines.append(f"{len(slice_) + 1}. Next page")
+    return "\n".join(lines)
